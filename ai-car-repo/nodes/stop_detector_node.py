@@ -1,0 +1,1 @@
+# Stop detector node placeholder

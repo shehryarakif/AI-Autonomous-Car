@@ -2,16 +2,8 @@ name: Bounty Solver
 
 on:
   schedule:
-    # Run every 6 hours
     - cron: '0 */6 * * *'
   workflow_dispatch:
-    inputs:
-      repo:
-        description: 'Target repository (owner/repo)'
-        required: false
-      issue_number:
-        description: 'Specific issue number to solve'
-        required: false
 
 permissions:
   contents: write
@@ -19,12 +11,10 @@ permissions:
   issues: read
 
 jobs:
-  scan-and-solve:
+  solve-bounty:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    
     steps:
-      - name: Checkout repository
+      - name: Checkout this repo (for scripts)
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -33,10 +23,36 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests pyyaml
+        run: pip install requests
 
-      - name: Run bounty scanner
+      - name: Select bounty to solve
+        id: select
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}  # Optional for AI solving
-        run: python scripts/bounty_scanner.py
+        run: |
+          # Run a script that picks ONE bounty and outputs its repo URL and issue number
+          python scripts/select_bounty.py > selected.json
+          echo "repo_url=$(jq -r .repo_url selected.json)" >> $GITHUB_OUTPUT
+          echo "issue_number=$(jq -r .issue_number selected.json)" >> $GITHUB_OUTPUT
+          echo "bounty_title=$(jq -r .title selected.json)" >> $GITHUB_OUTPUT
+
+      - name: Checkout target repository
+        if: steps.select.outputs.repo_url != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.select.outputs.repo_url }}
+          path: target-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate solution with Gemini CLI
+        if: steps.select.outputs.repo_url != ''
+        uses: google-github-actions/run-gemini-cli@v0
+        with:
+          working-directory: target-repo
+          prompt: |
+            You are solving GitHub issue #${{ steps.select.outputs.issue_number }}: "${{ steps.select.outputs.bounty_title }}".
+            Please read the issue, understand the codebase, implement a fix, and commit the changes.
+            In your commit message, include "Fixes #${{ steps.select.outputs.issue_number }}".
+          api-key: ${{ secrets.GEMINI_API_KEY }}
+          auto-commit: true
+          create-pr: true

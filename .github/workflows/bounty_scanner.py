@@ -17,3 +17,10 @@ if __name__ == "__main__":
     bounties = find_bounties()
     for issue in bounties:
         print(f"Found bounty: {issue['html_url']} - {issue['title']}")
+
+      - name: Run bounty scanner
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: "zio/zio"
+          TARGET_ISSUE: "9909"
+        run: python scripts/bounty_scanner.py

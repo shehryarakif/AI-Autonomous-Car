@@ -1,58 +1,171 @@
-name: Bounty Solver
+#!/usr/bin/env python3
+"""
+Automated Bounty Solver using Gemini AI.
 
-on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+This script:
+1. Fetches open issues labeled "bounty" from a configured list of repositories.
+2. Selects one issue (oldest or random, configurable).
+3. Clones the repository.
+4. Reads the issue title, body, and comments.
+5. Sends the context to Google Gemini API with instructions to generate a fix.
+6. Applies the suggested changes (as a patch or full file replacements).
+7. Commits and pushes a new branch.
+8. Creates a pull request targeting the default branch.
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: read
+Environment variables:
+- GITHUB_TOKEN: Personal Access Token (classic) with 'repo' scope.
+- GEMINI_API_KEY: Google Gemini API key.
+- (Optional) TARGET_REPOS: comma-separated list of "owner/repo" (defaults to hardcoded list).
+- (Optional) LABELS: comma-separated labels to filter issues (default: "bounty").
+"""
 
-jobs:
-  solve-bounty:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout this repo (for scripts)
-        uses: actions/checkout@v4
+import os
+import sys
+import json
+import subprocess
+import tempfile
+import shutil
+import random
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+import requests
+from github import Github, GithubException
+from github.Issue import Issue
+import google.generativeai as genai
 
-      - name: Install dependencies
-        run: pip install requests
+# ------------------------- Configuration -------------------------
 
-      - name: Select bounty to solve
-        id: select
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Run a script that picks ONE bounty and outputs its repo URL and issue number
-          python scripts/select_bounty.py > selected.json
-          echo "repo_url=$(jq -r .repo_url selected.json)" >> $GITHUB_OUTPUT
-          echo "issue_number=$(jq -r .issue_number selected.json)" >> $GITHUB_OUTPUT
-          echo "bounty_title=$(jq -r .title selected.json)" >> $GITHUB_OUTPUT
+# Default repositories to scan (can be overridden by TARGET_REPOS env var)
+DEFAULT_REPOS = [
+    "owner/repo1",
+    "owner/repo2",
+    # Add your own repositories here
+]
 
-      - name: Checkout target repository
-        if: steps.select.outputs.repo_url != ''
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.select.outputs.repo_url }}
-          path: target-repo
-          token: ${{ secrets.GITHUB_TOKEN }}
+LABELS = os.environ.get("LABELS", "bounty").split(",")
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+SELECTION_STRATEGY = os.environ.get("SELECTION_STRATEGY", "oldest")  # 'oldest' or 'random'
 
-      - name: Generate solution with Gemini CLI
-        if: steps.select.outputs.repo_url != ''
-        uses: google-github-actions/run-gemini-cli@v0
-        with:
-          working-directory: target-repo
-          prompt: |
-            You are solving GitHub issue #${{ steps.select.outputs.issue_number }}: "${{ steps.select.outputs.bounty_title }}".
-            Please read the issue, understand the codebase, implement a fix, and commit the changes.
-            In your commit message, include "Fixes #${{ steps.select.outputs.issue_number }}".
-          api-key: ${{ secrets.GEMINI_API_KEY }}
-          auto-commit: true
-          create-pr: true
+# Gemini model
+GEMINI_MODEL = "gemini-1.5-flash"  # or "gemini-1.5-pro"
+
+# ------------------------- Helper functions -------------------------
+
+def setup_logging():
+    """Simple logging to stderr."""
+    def log(level, msg):
+        timestamp = datetime.utcnow().isoformat()
+        print(f"[{timestamp}] {level}: {msg}", file=sys.stderr)
+    return log
+
+log = setup_logging()
+
+def get_target_repos() -> List[str]:
+    """Return list of repositories to scan from env or default."""
+    repos_env = os.environ.get("TARGET_REPOS")
+    if repos_env:
+        return [r.strip() for r in repos_env.split(",") if r.strip()]
+    return DEFAULT_REPOS
+
+def fetch_bounty_issues(g: Github, repos: List[str]) -> List[Tuple[str, Issue]]:
+    """
+    Fetch open issues with any of the configured labels from the given repos.
+    Returns list of (repo_full_name, issue) tuples.
+    """
+    candidates = []
+    for repo_name in repos:
+        try:
+            repo = g.get_repo(repo_name)
+        except GithubException as e:
+            log("WARNING", f"Cannot access repo {repo_name}: {e}")
+            continue
+
+        # Search for open issues with required labels
+        # Using repo.get_issues(state='open', labels=LABELS) is simpler
+        try:
+            issues = repo.get_issues(state='open', labels=LABELS)
+            for issue in issues:
+                if not issue.pull_request:  # exclude PRs
+                    candidates.append((repo_name, issue))
+        except GithubException as e:
+            log("WARNING", f"Failed to fetch issues from {repo_name}: {e}")
+    return candidates
+
+def select_issue(candidates: List[Tuple[str, Issue]]) -> Optional[Tuple[str, Issue]]:
+    """Pick one issue based on selection strategy."""
+    if not candidates:
+        return None
+    if SELECTION_STRATEGY == "random":
+        return random.choice(candidates)
+    else:  # oldest by creation date
+        return min(candidates, key=lambda x: x[1].created_at)
+
+def clone_repo(repo_full_name: str, target_dir: str, token: str) -> bool:
+    """Clone the repository using HTTPS with token authentication."""
+    clone_url = f"https://{token}@github.com/{repo_full_name}.git"
+    try:
+        subprocess.run(
+            ["git", "clone", clone_url, target_dir],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        log("INFO", f"Cloned {repo_full_name} into {target_dir}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log("ERROR", f"Git clone failed: {e.stderr}")
+        return False
+
+def get_issue_context(issue: Issue) -> str:
+    """Build a text context from issue title, body, and comments."""
+    context = f"# Issue #{issue.number}: {issue.title}\n\n"
+    if issue.body:
+        context += f"## Description\n{issue.body}\n\n"
+    else:
+        context += "## Description\n(no description provided)\n\n"
+
+    # Fetch comments (limit to last 10 to avoid token overflow)
+    comments = issue.get_comments()
+    if comments.totalCount > 0:
+        context += "## Comments\n"
+        for i, comment in enumerate(comments[:10]):
+            context += f"**{comment.user.login}**: {comment.body}\n\n"
+    return context
+
+def call_gemini(prompt: str, api_key: str) -> Optional[str]:
+    """Send prompt to Gemini and return the generated text."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        log("ERROR", f"Gemini API error: {e}")
+        return None
+
+def build_gemini_prompt(issue_context: str, repo_path: str) -> str:
+    """
+    Create a prompt that asks Gemini to analyze the repository and produce a concrete fix.
+    The prompt encourages output in a parseable format (e.g., diff or file changes).
+    """
+    # Optionally, we can read a few key files to give more context (e.g., README, setup.py)
+    # For simplicity, we ask Gemini to output a unified diff.
+    return f"""
+You are an expert software engineer. You are given a GitHub issue and a cloned repository at `{repo_path}`.
+Your task is to produce a fix that resolves the issue.
+
+Instructions:
+1. Understand the problem from the issue.
+2. Explore the codebase (you may assume you have filesystem access, but in this simulated environment, produce the necessary changes).
+3. Output a **unified git diff** (like `git diff`) that, when applied, fixes the issue.
+4. The diff must be complete and correct. Include only the changes needed.
+5. If the fix requires adding/removing files, include `diff --git` entries for those as well.
+6. After the diff, provide a short explanation (optional) but the diff must be first and clearly marked.
+
+Here is the issue context:
+{issue_context}
+
+Now produce the diff. Begin with:
+```diff
+... your diff here ...

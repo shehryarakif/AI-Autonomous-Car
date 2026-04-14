@@ -1,0 +1,3 @@
+git add .github/workflows/bounty-solver.yml scripts/bounty_solver.py
+git commit -m "Add bounty solver workflow (clean start)"
+git push origin main   # or your default branch

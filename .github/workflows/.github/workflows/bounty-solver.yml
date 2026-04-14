@@ -1,0 +1,24 @@
+name: Bounty Solver
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  solve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install PyGithub google-generativeai
+      - name: Solve bounty
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_FOR_BOUNTY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_REPOS: "owner/actual-repo-1,owner/actual-repo-2"   # CHANGE THESE
+          LABELS: "bounty"
+          DRY_RUN: "false"   # set to "true" for testing first
+        run: python scripts/bounty_solver.py

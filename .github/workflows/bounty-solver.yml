@@ -1,78 +1,42 @@
 #!/usr/bin/env python3
 """
 Automated Bounty Solver using Gemini AI.
-
-This script:
-1. Fetches open issues labeled "bounty" from a configured list of repositories.
-2. Selects one issue (oldest or random, configurable).
-3. Clones the repository.
-4. Reads the issue title, body, and comments.
-5. Sends the context to Google Gemini API with instructions to generate a fix.
-6. Applies the suggested changes (as a patch or full file replacements).
-7. Commits and pushes a new branch.
-8. Creates a pull request targeting the default branch.
-
-Environment variables:
-- GITHUB_TOKEN: Personal Access Token (classic) with 'repo' scope.
-- GEMINI_API_KEY: Google Gemini API key.
-- (Optional) TARGET_REPOS: comma-separated list of "owner/repo" (defaults to hardcoded list).
-- (Optional) LABELS: comma-separated labels to filter issues (default: "bounty").
 """
 
 import os
 import sys
-import json
-import subprocess
 import tempfile
-import shutil
 import random
+import subprocess
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import requests
 from github import Github, GithubException
 from github.Issue import Issue
 import google.generativeai as genai
 
-# ------------------------- Configuration -------------------------
-
-# Default repositories to scan (can be overridden by TARGET_REPOS env var)
+# ---------- Configuration ----------
 DEFAULT_REPOS = [
-    "owner/repo1",
+    "owner/repo1",   # Replace with your actual repos
     "owner/repo2",
-    # Add your own repositories here
 ]
-
 LABELS = os.environ.get("LABELS", "bounty").split(",")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 SELECTION_STRATEGY = os.environ.get("SELECTION_STRATEGY", "oldest")  # 'oldest' or 'random'
+GEMINI_MODEL = "gemini-1.5-flash"
 
-# Gemini model
-GEMINI_MODEL = "gemini-1.5-flash"  # or "gemini-1.5-pro"
+# ---------- Logging ----------
+def log(level, msg):
+    print(f"[{datetime.utcnow().isoformat()}] {level}: {msg}", file=sys.stderr)
 
-# ------------------------- Helper functions -------------------------
-
-def setup_logging():
-    """Simple logging to stderr."""
-    def log(level, msg):
-        timestamp = datetime.utcnow().isoformat()
-        print(f"[{timestamp}] {level}: {msg}", file=sys.stderr)
-    return log
-
-log = setup_logging()
-
+# ---------- Helpers ----------
 def get_target_repos() -> List[str]:
-    """Return list of repositories to scan from env or default."""
     repos_env = os.environ.get("TARGET_REPOS")
     if repos_env:
         return [r.strip() for r in repos_env.split(",") if r.strip()]
     return DEFAULT_REPOS
 
 def fetch_bounty_issues(g: Github, repos: List[str]) -> List[Tuple[str, Issue]]:
-    """
-    Fetch open issues with any of the configured labels from the given repos.
-    Returns list of (repo_full_name, issue) tuples.
-    """
     candidates = []
     for repo_name in repos:
         try:
@@ -80,36 +44,28 @@ def fetch_bounty_issues(g: Github, repos: List[str]) -> List[Tuple[str, Issue]]:
         except GithubException as e:
             log("WARNING", f"Cannot access repo {repo_name}: {e}")
             continue
-
-        # Search for open issues with required labels
-        # Using repo.get_issues(state='open', labels=LABELS) is simpler
         try:
             issues = repo.get_issues(state='open', labels=LABELS)
             for issue in issues:
-                if not issue.pull_request:  # exclude PRs
+                if not issue.pull_request:
                     candidates.append((repo_name, issue))
         except GithubException as e:
             log("WARNING", f"Failed to fetch issues from {repo_name}: {e}")
     return candidates
 
-def select_issue(candidates: List[Tuple[str, Issue]]) -> Optional[Tuple[str, Issue]]:
-    """Pick one issue based on selection strategy."""
+def select_issue(candidates):
     if not candidates:
         return None
     if SELECTION_STRATEGY == "random":
         return random.choice(candidates)
-    else:  # oldest by creation date
-        return min(candidates, key=lambda x: x[1].created_at)
+    return min(candidates, key=lambda x: x[1].created_at)   # oldest
 
 def clone_repo(repo_full_name: str, target_dir: str, token: str) -> bool:
-    """Clone the repository using HTTPS with token authentication."""
     clone_url = f"https://{token}@github.com/{repo_full_name}.git"
     try:
         subprocess.run(
             ["git", "clone", clone_url, target_dir],
-            check=True,
-            capture_output=True,
-            text=True
+            check=True, capture_output=True, text=True
         )
         log("INFO", f"Cloned {repo_full_name} into {target_dir}")
         return True
@@ -118,14 +74,9 @@ def clone_repo(repo_full_name: str, target_dir: str, token: str) -> bool:
         return False
 
 def get_issue_context(issue: Issue) -> str:
-    """Build a text context from issue title, body, and comments."""
     context = f"# Issue #{issue.number}: {issue.title}\n\n"
     if issue.body:
         context += f"## Description\n{issue.body}\n\n"
-    else:
-        context += "## Description\n(no description provided)\n\n"
-
-    # Fetch comments (limit to last 10 to avoid token overflow)
     comments = issue.get_comments()
     if comments.totalCount > 0:
         context += "## Comments\n"
@@ -134,7 +85,6 @@ def get_issue_context(issue: Issue) -> str:
     return context
 
 def call_gemini(prompt: str, api_key: str) -> Optional[str]:
-    """Send prompt to Gemini and return the generated text."""
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(GEMINI_MODEL)
     try:
@@ -145,23 +95,16 @@ def call_gemini(prompt: str, api_key: str) -> Optional[str]:
         return None
 
 def build_gemini_prompt(issue_context: str, repo_path: str) -> str:
-    """
-    Create a prompt that asks Gemini to analyze the repository and produce a concrete fix.
-    The prompt encourages output in a parseable format (e.g., diff or file changes).
-    """
-    # Optionally, we can read a few key files to give more context (e.g., README, setup.py)
-    # For simplicity, we ask Gemini to output a unified diff.
     return f"""
 You are an expert software engineer. You are given a GitHub issue and a cloned repository at `{repo_path}`.
 Your task is to produce a fix that resolves the issue.
 
 Instructions:
 1. Understand the problem from the issue.
-2. Explore the codebase (you may assume you have filesystem access, but in this simulated environment, produce the necessary changes).
+2. Explore the codebase (you may assume you have filesystem access).
 3. Output a **unified git diff** (like `git diff`) that, when applied, fixes the issue.
-4. The diff must be complete and correct. Include only the changes needed.
-5. If the fix requires adding/removing files, include `diff --git` entries for those as well.
-6. After the diff, provide a short explanation (optional) but the diff must be first and clearly marked.
+4. The diff must be complete and correct.
+5. Begin the diff with a code block labeled `diff`.
 
 Here is the issue context:
 {issue_context}
